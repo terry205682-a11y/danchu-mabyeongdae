@@ -48,54 +48,76 @@ export function safeSoopImageUrl(raw) {
 const safeProfile = safeSoopImageUrl;
 
 const domains = ['sooplive.com', 'sooplive.co.kr'];
-/** 공개 방송국의 읽기 전용 API. 응답 변경/차단 시 수동 입력 가능. fetchImpl 주입으로 외부망 없이 테스트. */
+/** 공개 방송국의 읽기 전용 API. 방송국 기본 API와 현재 방송 상태 API를 상호 보완해 조회한다. */
 export async function lookupSoopProfile(input, { fetchImpl = globalThis.fetch, timeoutMs = 5000 } = {}) {
   const bjId = parseSoopId(input);
   let unreachable = false;
+  let verifiedPhoto = '';
+  const fallbackPhoto = `https://profile.img.sooplive.com/LOGO/${bjId.slice(0, 2)}/${bjId}/${bjId}.jpg`;
+
+  // SOOP 공개 응답은 API별로 서로 다른 필드를 담는다. 응답 크기를 제한한다.
+  const readJson = async (url) => {
+    const res = await fetchImpl(url, {
+      method: 'GET', headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(timeoutMs), redirect: 'error'
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`SOOP returned ${res.status}`);
+    const len = Number(res.headers?.get?.('content-length') || 0);
+    if (len > 524288) throw new Error('SOOP response too large');
+    const raw = await res.text();
+    if (raw.length > 524288) throw new Error('SOOP response too large');
+    return JSON.parse(raw);
+  };
+  const makeResult = (nickname, image = '') => ({
+    bjId, nickname: nickname.trim().slice(0, 60),
+    photoUrl: image || verifiedPhoto || fallbackPhoto,
+    photoVerified: Boolean(image || verifiedPhoto), soopUrl: canonicalSoopUrl(bjId)
+  });
+
+  // 방송국 페이지 정보: 주로 프로필 사진 및 방송국 레이아웃 정보를 제공한다.
   for (const domain of domains) {
-    const endpoint = `https://chapi.${domain}/api/${encodeURIComponent(bjId)}/station`;
-    let res;
+    let body;
     try {
-      res = await fetchImpl(endpoint, {
-        method: 'GET',
-        headers: { 'Accept': 'application/json' },
-        signal: AbortSignal.timeout(timeoutMs),
-        redirect: 'error'
-      });
-    } catch { unreachable = true; continue; }
-    if (res.status === 404) continue;
-    if (!res.ok) { unreachable = true; continue; }
-    try {
-      const len = Number(res.headers?.get?.('content-length') || 0);
-      if (len > 524288) { unreachable = true; continue; }
-      const text = await res.text();
-      if (text.length > 524288) { unreachable = true; continue; }
-      const body = JSON.parse(text);
-      const station = body?.station || body?.data?.station || body?.data || {};
-      // Never silently use BJ ID as a nickname. In that case require manual input.
-      // The live SOOP station API can put the broadcaster's nickname inside
-      // `broad`, while `station` contains only layout and station metadata.
-      // Accept both current and older shapes without using BJ ID as a nickname.
-      const nickname = [
-        station.user_nick, station.userNick, station.nickname,
-        body?.broad?.user_nick, body?.broad?.userNick,
-        body?.user?.user_nick, body?.user?.userNick,
-        body?.data?.broad?.user_nick, body?.data?.user?.user_nick,
-        body?.user_nick, body?.nickname
-      ].find(v => typeof v === 'string' && v.trim());
-      if (!nickname) continue;
-      const image = [body?.profile_image, station?.profile_image, body?.data?.profile_image,
-        body?.broad?.profile_image, body?.user?.profile_image,
-        body?.data?.broad?.profile_image, body?.data?.user?.profile_image,
-        station?.profile_img, station?.profileImage, station?.user_profile_image, station?.station_logo,
-        body?.station_image, body?.logo_url]
-        .map(safeProfile).find(Boolean) || '';
-      // Known CDN path is a candidate only, never described as a verified photo.
-      const fallback = `https://profile.img.sooplive.com/LOGO/${bjId.slice(0, 2)}/${bjId}/${bjId}.jpg`;
-      return { bjId, nickname:nickname.trim().slice(0, 60), photoUrl:image || fallback,
-        photoVerified:Boolean(image), soopUrl: canonicalSoopUrl(bjId) };
-    } catch { unreachable = true; }
+      body = await readJson(`https://chapi.${domain}/api/${encodeURIComponent(bjId)}/station`);
+    } catch (err) {
+      console.warn(`[SOOP] chapi.${domain} lookup failed: ${err?.message || "request failed"}`);
+      unreachable = true; continue;
+    }
+    if (!body) continue;
+    const station = body?.station || body?.data?.station || body?.data || {};
+    const image = [body?.profile_image, station?.profile_image, body?.data?.profile_image,
+      body?.broad?.profile_image, body?.user?.profile_image,
+      body?.data?.broad?.profile_image, body?.data?.user?.profile_image,
+      station?.profile_img, station?.profileImage, station?.user_profile_image,
+      station?.station_logo, body?.station_image, body?.logo_url]
+      .map(safeProfile).find(Boolean) || '';
+    if (image) verifiedPhoto = image;
+    const nickname = [
+      station.user_nick, station.userNick, station.nickname,
+      station?.broad?.user_nick, body?.broad?.user_nick, body?.broad?.userNick,
+      body?.user?.user_nick, body?.user?.userNick,
+      body?.data?.broad?.user_nick, body?.data?.user?.user_nick,
+      body?.user_nick, body?.nickname
+    ].find(v => typeof v === 'string' && v.trim());
+    if (nickname) return makeResult(nickname, image);
   }
-  if (unreachable) throw new SoopLookupError('SOOP 방송국에 연결할 수 없습니다. 잠시 뒤 재시도하거나 이름과 프로필을 직접 입력해 주세요.', 502);
+
+  // chapi.station에는 닉네임이 없을 수 있다. 실제 공개 방송 상태 API의 DATA.user_nick을 별도로 확인한다.
+  // URL 형식: https://st.sooplive.com/api/get_station_status.php?szBjId=danchu17
+  try {
+    const status = await readJson(`https://st.sooplive.com/api/get_station_status.php?szBjId=${encodeURIComponent(bjId)}`);
+    const info = status?.DATA;
+    const found = status && (status.RESULT === 1 || status.RESULT === '1');
+    if (found && info && (!info.user_id || String(info.user_id).toLowerCase() === bjId)) {
+      const nickname = [info.user_nick, info.station_name].find(v => typeof v === 'string' && v.trim());
+      if (nickname) return makeResult(nickname, safeProfile(info.profile_image));
+    }
+  } catch (err) {
+    console.warn(`[SOOP] st.sooplive.com lookup failed: ${err?.message || "request failed"}`);
+    unreachable = true;
+  }
+
+  if (unreachable) throw new SoopLookupError('SOOP 공개 API 연결 또는 응답 처리에 실패했습니다. 잠시 뒤 재시도하거나 이름과 프로필을 직접 입력해 주세요.', 502);
   throw new SoopLookupError('방송국 정보를 찾을 수 없습니다. 방송국 주소를 확인하거나 직접 입력해 주세요.', 404);
 }
