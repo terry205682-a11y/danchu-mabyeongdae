@@ -31,8 +31,29 @@ for(const key of ['admins','soldiers','scores','eliminations','officers','report
 if(!db.settings||typeof db.settings!=='object')db.settings=fresh().settings;
 if(typeof db.settings.assignedPlatoon!=='string')db.settings.assignedPlatoon='';
 if(!db.settings.platoonNames||typeof db.settings.platoonNames!=='object'||Array.isArray(db.settings.platoonNames))db.settings.platoonNames={};
-const hashPass = password => { const salt=crypto.randomBytes(16).toString('hex'); return `${salt}:${crypto.pbkdf2Sync(password,salt,180000,32,'sha256').toString('hex')}`; };
-function checkPass(password, digest) { try{const [salt,hash]=digest.split(':');const a=Buffer.from(hash,'hex'),b=crypto.pbkdf2Sync(password,salt,180000,a.length,'sha256');return crypto.timingSafeEqual(a,b);}catch{return false;} }
+// A versioned digest lets existing 180k PBKDF2 accounts log in and upgrade safely.
+const PBKDF2_ITERATIONS = 600000;
+const MIN_NEW_PASSWORD = 15;
+const hashPass = password => { const salt=crypto.randomBytes(16).toString('hex'); return `pbkdf2-sha256$${PBKDF2_ITERATIONS}$${salt}$${crypto.pbkdf2Sync(password,salt,PBKDF2_ITERATIONS,32,'sha256').toString('hex')}`; };
+function checkPass(password, digest) {
+  try {
+    if(typeof password!=='string'||typeof digest!=='string')return false;
+    let salt, hash, iterations;
+    if(digest.startsWith('pbkdf2-sha256$')) {
+      const parts=digest.split('$');if(parts.length!==4)return false;
+      [,iterations,salt,hash]=parts;iterations=Number(iterations);
+      if(!Number.isInteger(iterations)||iterations<180000||iterations>2000000)return false;
+    } else {
+      const parts=digest.split(':');if(parts.length!==2)return false;
+      [salt,hash]=parts;iterations=180000;
+    }
+    if(!/^[a-f0-9]{32}$/i.test(salt)||!/^[a-f0-9]{64}$/i.test(hash))return false;
+    const actual=Buffer.from(hash,'hex');
+    const derived=crypto.pbkdf2Sync(password,salt,iterations,actual.length,'sha256');
+    return crypto.timingSafeEqual(actual,derived);
+  } catch {return false;}
+}
+function needsPasswordUpgrade(digest) { return typeof digest==='string'&&!digest.startsWith(`pbkdf2-sha256$${PBKDF2_ITERATIONS}$`); }
 let writeQueue=Promise.resolve();
 function persist() {
   const snapshot=JSON.stringify(db,null,2);
@@ -47,7 +68,12 @@ const isAdminUser = u => u?.role === 'owner' || u?.role === 'admin';
 function scoreFor(s){const items=db.scores.filter(x=>x.soldierId===s.id);const merit=items.filter(x=>x.kind==='merit').reduce((n,x)=>n+x.points,0),penalty=items.filter(x=>x.kind==='penalty').reduce((n,x)=>n+x.points,0);return {...s,merit,penalty,total:merit-penalty};}
 function ranked(){const list=db.soldiers.map(s=>scoreFor({...s,platoon:db.settings.assignedPlatoon||'배정 대기'})).sort((a,b)=>Number(a.eliminated)-Number(b.eliminated)||b.total-a.total||a.name.localeCompare(b.name,'ko'));let last=null,rank=0,aliveIndex=0;return list.map((s)=>{if(!s.eliminated){aliveIndex++;if(last!==s.total){rank=aliveIndex;last=s.total;}}return {...s,rank:s.eliminated?null:rank};});}
 const FORCE_LOG_TYPES = new Set(['상점 부여','벌점 부여','점수 기록 취소','탈락 지정','탈락 취소']);
-function publicState(user){const soldiers=ranked(),active=soldiers.filter(s=>!s.eliminated),all=db.scores;return {ready:db.admins.length>0,user:userSafe(user),summary:{current:active.length,eliminated:soldiers.length-active.length,merit:all.filter(x=>x.kind==='merit').reduce((n,x)=>n+x.points,0),penalty:all.filter(x=>x.kind==='penalty').reduce((n,x)=>n+x.points,0),officers:db.officers.filter(x=>x.name).length,updatedAt:db.activity[0]?.createdAt||null},soldiers,officers:db.officers,reports:isAdminUser(user)?db.reports.slice(0,100):[],scores:all.slice(0,300).map(s=>({...s,soldierName:db.soldiers.find(x=>x.id===s.soldierId)?.name||'삭제된 병사'})),activity:isAdminUser(user)?db.activity.slice(0,100):[],forceActivity:db.activity.filter(a=>FORCE_LOG_TYPES.has(a.type)).slice(0,100),eliminations:db.eliminations,settings:db.settings,users:user?.role==='owner'?db.admins.map(userSafe):[]};}
+function publicState(user){
+  const soldiers=ranked(),active=soldiers.filter(s=>!s.eliminated),all=db.scores;
+  const showActor=isAdminUser(user);
+  const visibleActor=record=>showActor?record:{...record,actor:'관리자'};
+  return {ready:db.admins.length>0,user:userSafe(user),summary:{current:active.length,eliminated:soldiers.length-active.length,merit:all.filter(x=>x.kind==='merit').reduce((n,x)=>n+x.points,0),penalty:all.filter(x=>x.kind==='penalty').reduce((n,x)=>n+x.points,0),officers:db.officers.filter(x=>x.name).length,updatedAt:db.activity[0]?.createdAt||null},soldiers,officers:db.officers,reports:showActor?db.reports.slice(0,100):[],scores:all.slice(0,300).map(s=>visibleActor({...s,soldierName:db.soldiers.find(x=>x.id===s.soldierId)?.name||'삭제된 병사'})),activity:showActor?db.activity.slice(0,100):[],forceActivity:db.activity.filter(a=>FORCE_LOG_TYPES.has(a.type)).slice(0,100).map(visibleActor),eliminations:db.eliminations.map(visibleActor),settings:db.settings,users:user?.role==='owner'?db.admins.map(userSafe):[]};
+}
 function send(res,status,data,extra={}){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store',...extra});res.end(JSON.stringify(data));}
 function problem(res,status,message){send(res,status,{error:message});}
 function validUrl(value){if(!value)return '';try{const url=new URL(value);if(!['http:','https:'].includes(url.protocol))throw 0;return url.toString().slice(0,400);}catch{throw new Error('방송국/프로필 주소는 http(s) 링크여야 합니다.');}}
@@ -95,9 +121,9 @@ async function action(res,actor,a){const p=a.payload||{};let result={};switch(a.
     if(scope==='activity'||scope==='all')db.activity=[];
     result={scope,reset:true};break;
   }
-  case 'user.add': {if(actor.role!=='owner')throw new Error('최고 관리자만 계정을 추가할 수 있습니다.');const username=expectName(p.username,'아이디').toLowerCase();if(!/^[a-z0-9_]{3,24}$/.test(username))throw new Error('아이디는 영문 소문자·숫자·밑줄 3~24자만 가능합니다.');if(db.admins.some(u=>u.username===username))throw new Error('이미 존재하는 아이디입니다.');if(!['admin','viewer'].includes(p.role))throw new Error('역할을 선택해 주세요.');if(p.role==='admin'&&db.admins.filter(u=>u.role!=='viewer').length>=2)throw new Error('관리자 계정은 총 2명까지만 등록할 수 있습니다.');if(typeof p.password!=='string'||p.password.length<10)throw new Error('비밀번호는 10자 이상으로 설정해 주세요.');db.admins.push({id:id(),username,pass:hashPass(p.password),role:p.role,createdAt:now()});activity('계정 추가',`${username} (${p.role})`,actor.username);break;}
+  case 'user.add': {if(actor.role!=='owner')throw new Error('최고 관리자만 계정을 추가할 수 있습니다.');const username=expectName(p.username,'아이디').toLowerCase();if(!/^[a-z0-9_]{3,24}$/.test(username))throw new Error('아이디는 영문 소문자·숫자·밑줄 3~24자만 가능합니다.');if(db.admins.some(u=>u.username===username))throw new Error('이미 존재하는 아이디입니다.');if(!['admin','viewer'].includes(p.role))throw new Error('역할을 선택해 주세요.');if(p.role==='admin'&&db.admins.filter(u=>u.role!=='viewer').length>=2)throw new Error('관리자 계정은 총 2명까지만 등록할 수 있습니다.');if(typeof p.password!=='string'||p.password.length<MIN_NEW_PASSWORD)throw new Error('비밀번호는 15자 이상으로 설정해 주세요.');db.admins.push({id:id(),username,pass:hashPass(p.password),role:p.role,createdAt:now()});activity('계정 추가',`${username} (${p.role})`,actor.username);break;}
   case 'user.remove': {if(actor.role!=='owner')throw new Error('최고 관리자만 계정을 삭제할 수 있습니다.');const u=db.admins.find(x=>x.id===p.id);if(!u||u.id===actor.id)throw new Error('본인 또는 없는 계정은 삭제할 수 없습니다.');db.admins=db.admins.filter(x=>x.id!==u.id);for(const [token,sess] of sessions)if(sess.userId===u.id)sessions.delete(token);activity('계정 삭제',u.username,actor.username);break;}
-  case 'password.change': {if(!checkPass(p.oldPassword||'',actor.pass))throw new Error('현재 비밀번호가 올바르지 않습니다.');if(typeof p.newPassword!=='string'||p.newPassword.length<10)throw new Error('새 비밀번호는 10자 이상이어야 합니다.');actor.pass=hashPass(p.newPassword);for(const [token,sess] of sessions)if(sess.userId===actor.id)sessions.delete(token);activity('비밀번호 변경',actor.username,actor.username);break;}
+  case 'password.change': {if(!checkPass(p.oldPassword||'',actor.pass))throw new Error('현재 비밀번호가 올바르지 않습니다.');if(typeof p.newPassword!=='string'||p.newPassword.length<MIN_NEW_PASSWORD)throw new Error('새 비밀번호는 15자 이상이어야 합니다.');actor.pass=hashPass(p.newPassword);for(const [token,sess] of sessions)if(sess.userId===actor.id)sessions.delete(token);activity('비밀번호 변경',actor.username,actor.username);break;}
   default:throw new Error('지원하지 않는 작업입니다.');
 }await persist();send(res,200,{success:true,result});}
 const mime={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.ico':'image/x-icon'};
@@ -106,8 +132,8 @@ const server=http.createServer(async(req,res)=>{
   const url=new URL(req.url,'http://localhost');const route=url.pathname;
   try {
     if(route==='/api/bootstrap'&&req.method==='GET')return send(res,200,publicState(userFrom(req)));
-    if(route==='/api/setup'&&req.method==='POST'){if(db.admins.length)return problem(res,409,'이미 최초 관리자가 설정되었습니다.');const p=await body(req);const a=Buffer.from(String(p.setupKey||'')),b=Buffer.from(SETUP_KEY);if(a.length!==b.length||!crypto.timingSafeEqual(a,b))return problem(res,403,'설치 키가 올바르지 않습니다.');const username=expectName(p.username,'아이디').toLowerCase();if(!/^[a-z0-9_]{3,24}$/.test(username))throw new Error('아이디는 영문 소문자·숫자·밑줄 3~24자만 가능합니다.');if(typeof p.password!=='string'||p.password.length<10)throw new Error('비밀번호는 10자 이상이어야 합니다.');const user={id:id(),username,pass:hashPass(p.password),role:'owner',createdAt:now()};db.admins.push(user);activity('시스템 설치','최고 관리자 등록',username);await persist();return logIn(res,user,req);}
-    if(route==='/api/login'&&req.method==='POST'){const ip=req.socket.remoteAddress||'unknown',attempt=loginAttempts.get(ip)||{count:0,until:0};if(attempt.until>Date.now()&&attempt.count>=8)return problem(res,429,'로그인 시도가 많습니다. 잠시 후 다시 시도해 주세요.');const p=await body(req);const user=db.admins.find(u=>u.username===okString(p.username,60).toLowerCase());if(!user||!checkPass(p.password||'',user.pass)){const t=Date.now();loginAttempts.set(ip,{count:attempt.until>t?attempt.count+1:1,until:attempt.until>t?attempt.until:t+15*60000});return problem(res,401,'아이디 또는 비밀번호가 일치하지 않습니다.');}loginAttempts.delete(ip);return logIn(res,user,req);}
+    if(route==='/api/setup'&&req.method==='POST'){if(db.admins.length)return problem(res,409,'이미 최초 관리자가 설정되었습니다.');const p=await body(req);const a=Buffer.from(String(p.setupKey||'')),b=Buffer.from(SETUP_KEY);if(a.length!==b.length||!crypto.timingSafeEqual(a,b))return problem(res,403,'설치 키가 올바르지 않습니다.');const username=expectName(p.username,'아이디').toLowerCase();if(!/^[a-z0-9_]{3,24}$/.test(username))throw new Error('아이디는 영문 소문자·숫자·밑줄 3~24자만 가능합니다.');if(typeof p.password!=='string'||p.password.length<MIN_NEW_PASSWORD)throw new Error('비밀번호는 15자 이상이어야 합니다.');const user={id:id(),username,pass:hashPass(p.password),role:'owner',createdAt:now()};db.admins.push(user);activity('시스템 설치','최고 관리자 등록',username);await persist();return logIn(res,user,req);}
+    if(route==='/api/login'&&req.method==='POST'){const ip=req.socket.remoteAddress||'unknown',attempt=loginAttempts.get(ip)||{count:0,until:0};if(attempt.until>Date.now()&&attempt.count>=8)return problem(res,429,'로그인 시도가 많습니다. 잠시 후 다시 시도해 주세요.');const p=await body(req);const user=db.admins.find(u=>u.username===okString(p.username,60).toLowerCase());if(!user||!checkPass(p.password||'',user.pass)){const t=Date.now();loginAttempts.set(ip,{count:attempt.until>t?attempt.count+1:1,until:attempt.until>t?attempt.until:t+15*60000});return problem(res,401,'아이디 또는 비밀번호가 일치하지 않습니다.');}loginAttempts.delete(ip);if(needsPasswordUpgrade(user.pass)){user.pass=hashPass(p.password);await persist();}return logIn(res,user,req);}
     if(route==='/api/logout'&&req.method==='POST'){const t=(req.headers.cookie||'').match(/(?:^|;\s*)danchu_session=([\w-]+)/);if(t)sessions.delete(crypto.createHash('sha256').update(t[1]).digest('hex'));return send(res,200,{success:true},{'Set-Cookie':'danchu_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'});}
     if(route==='/api/soop-image'&&req.method==='GET'){
       const target=safeSoopImageUrl(url.searchParams.get('url'));
