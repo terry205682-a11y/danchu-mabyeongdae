@@ -1,0 +1,14 @@
+{
+  "name": "danchu-mabyeongdae-command",
+  "version": "12.0.0",
+  "private": true,
+  "type": "module",
+  "description": "단츄의 마병대 통합사령부 — 독립 실행형 풀스택 사이트",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/*.test.mjs"
+  }
+}
