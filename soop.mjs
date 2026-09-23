@@ -73,10 +73,20 @@ export async function lookupSoopProfile(input, { fetchImpl = globalThis.fetch, t
       const body = JSON.parse(text);
       const station = body?.station || body?.data?.station || body?.data || {};
       // Never silently use BJ ID as a nickname. In that case require manual input.
-      const nickname = [station.user_nick, station.userNick, station.nickname, body?.user_nick, body?.nickname]
-        .find(v => typeof v === 'string' && v.trim());
+      // The live SOOP station API can put the broadcaster's nickname inside
+      // `broad`, while `station` contains only layout and station metadata.
+      // Accept both current and older shapes without using BJ ID as a nickname.
+      const nickname = [
+        station.user_nick, station.userNick, station.nickname,
+        body?.broad?.user_nick, body?.broad?.userNick,
+        body?.user?.user_nick, body?.user?.userNick,
+        body?.data?.broad?.user_nick, body?.data?.user?.user_nick,
+        body?.user_nick, body?.nickname
+      ].find(v => typeof v === 'string' && v.trim());
       if (!nickname) continue;
       const image = [body?.profile_image, station?.profile_image, body?.data?.profile_image,
+        body?.broad?.profile_image, body?.user?.profile_image,
+        body?.data?.broad?.profile_image, body?.data?.user?.profile_image,
         station?.profile_img, station?.profileImage, station?.user_profile_image, station?.station_logo,
         body?.station_image, body?.logo_url]
         .map(safeProfile).find(Boolean) || '';
